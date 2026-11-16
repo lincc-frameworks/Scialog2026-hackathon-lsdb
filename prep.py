@@ -30,13 +30,40 @@ for _name in ("distributed", "numba", "lsdb", "hats"):
 plt.rcParams.update({"font.size": 16, "axes.labelsize": 18, "axes.titlesize": 18, "xtick.labelsize": 15,
                      "ytick.labelsize": 15, "legend.fontsize": 14, "figure.dpi": 90, "savefig.bbox": "tight"})
 
-DP2_PATH = "/sdf/data/rubin/shared/lsdb_commissioning/hats/dp2_rc/object_collection"
-GAIA_PATH = "/sdf/data/rubin/cosmicdata/lsdb/gaia_dr3"
-# Euclid DR1 (released 2026-11-12), converted to HATS by IRSA; this is a copy of their public bucket.
-EUCLID_PATH = "/sdf/data/rubin/cosmicdata/lsdb/euclid_dr1/mer_catalogue_{survey}_survey"
-# ZTF DR24 lightcurves: one row per object and filter, 2018 to 2025. Read from S3 (user decision 11-13).
-ZTF_PATH = "s3://ipac-irsa-ztf/ztf/enhanced/dr24/lc/hats"  # IRSA's public bucket; not mirrored on SDF
-ZTF_STORAGE = {"anon": True, "client_kwargs": {"endpoint_url": "https://s3.amazonaws.com"}}  # endpoint: needed behind the SDF proxy
+# ---------------------------------------------------------------------------------------------------------
+# Where the data are. This is the only block to change to run the notebook somewhere else: add an entry to
+# SITES, or pick one with SITE (or the environment variable SCIALOG_SITE). A path can be a local directory,
+# an https:// address or an s3:// bucket; LSDB opens all three the same way.
+SITES = {
+    "usdf": {  # the US Data Facility at SLAC: local copies
+        "rubin": "/sdf/data/rubin/shared/lsdb_commissioning/hats/dp2_rc/object_collection",
+        "gaia": "/sdf/data/rubin/cosmicdata/lsdb/gaia_dr3",
+        "euclid": "/sdf/data/rubin/cosmicdata/lsdb/euclid_dr1/mer_catalogue_{survey}_survey",
+        "ztf": "s3://ipac-irsa-ztf/ztf/enhanced/dr24/lc/hats",
+        "results": "/sdf/data/rubin/user/ncaplar/scialog-demo",
+    },
+    "public": {  # anywhere with a network connection; Rubin DP2 needs Rubin data rights and your own path
+        "rubin": "path/to/rubin_dp2/object_collection",
+        "gaia": "https://data.lsdb.io/hats/gaia_dr3",
+        "euclid": "s3://nasa-irsa-euclid-dr1/contributed/dr1/hats/reformatted_catalogs/mer_catalogue_{survey}_survey",
+        "ztf": "s3://ipac-irsa-ztf/ztf/enhanced/dr24/lc/hats",
+        "results": "scialog-demo-results",
+    },
+}
+SITE = os.environ.get("SCIALOG_SITE", "usdf")
+DP2_PATH = SITES[SITE]["rubin"]
+GAIA_PATH = SITES[SITE]["gaia"]
+EUCLID_PATH = SITES[SITE]["euclid"]  # Euclid DR1 (released 2026-11-12), converted to HATS by IRSA
+ZTF_PATH = SITES[SITE]["ztf"]  # ZTF DR24 lightcurves: one row per object and filter, 2018 to 2025; IRSA's bucket
+RESULTS_DIR = SITES[SITE]["results"]  # finished results, one directory per field, so slow steps can run ahead of time
+S3_PUBLIC = {"anon": True, "client_kwargs": {"endpoint_url": "https://s3.amazonaws.com"}}  # public buckets, also behind a proxy
+
+
+def _storage(path):
+    """Options LSDB needs to read ``path``: anonymous access for a public S3 bucket, nothing otherwise."""
+    return S3_PUBLIC if path.startswith("s3://") else None
+
+
 # ZTF positions are less precise, and each source can have one ZTF object per filter.
 ZTF_MATCH_RADIUS_ARCSEC = 1.5
 ZTF_FILTERS = {1: "ZTF g", 2: "ZTF r", 3: "ZTF i"}
@@ -64,6 +91,8 @@ MOTION_SNR_MAX = 3.0
 # SF_POINTS bins that hold about the same number of pairs each.
 LAG_BINS = (0.01, 0.03, 0.1, 0.5, *np.arange(1.5, 200, 1.0))  # within a night, then one bin per day
 SF_POINTS = 10
+# Fine time bins for ZTF, whose lightcurves span seven years: one per day.
+LAG_BINS_ZTF = tuple(np.arange(0.5, 3000, 1.0))
 # A source needs this many clean Rubin epochs to enter the structure function or a CARMA fit.
 MIN_EPOCHS = 50
 # Bands used for the structure function and the CARMA fits (u and y have few epochs).
@@ -85,21 +114,18 @@ EXCESS_MIN_MAG = 0.2
 LC_FIELDS = ["band", "midpointMjdTai", "psfFlux", "psfFluxErr", *BAD_FLAGS]
 # Bluest to reddest band: purple, green, red, brown, black; y (few epochs) in grey.
 BAND_COLORS = {"u": "tab:blue", "g": "tab:green", "r": "tab:red", "i": "peru", "z": "k", "y": "0.6"}
-# The amplitude of variability is quoted as the squared structure function at this time difference [days].
-SF_AT_DAYS = 100.0
 
 
-# Finished results are kept here, one directory per field, so the slow crossmatch can be run ahead of time.
-RESULTS_DIR = "/sdf/data/rubin/user/ncaplar/scialog-demo"
 
 
 def _results_path(cone):
     return os.path.join(RESULTS_DIR, f"field_{cone.ra:.3f}_{cone.dec:.3f}_{cone.radius_arcsec / 3600:.2f}deg")
 
 
-def catalog_path(cone):
-    """Where the catalog of AGN candidates and comparison stars of this field is written."""
-    return os.path.join(_results_path(cone), "agn_and_stars")
+def catalog_path(cone, name="agn_and_stars"):
+    """Where a catalog we write for this field goes: ``rubin_gaia_euclid`` (every matched source) or
+    ``agn_and_stars`` (the selected ones)."""
+    return os.path.join(_results_path(cone), name)
 
 
 def keep(cone, name, table):
@@ -124,20 +150,21 @@ def open_rubin(region=None, lightcurves=False, columns=None):
     columns = list(columns or ["objectId", "coord_ra", "coord_dec", "g_psfMag", "r_psfMag", "i_psfMag"])
     if lightcurves:
         columns += [f"objectForcedSource.{f}" for f in LC_FIELDS]
-    return lsdb.open_catalog(DP2_PATH, columns=columns, search_filter=region)
+    return lsdb.open_catalog(DP2_PATH, columns=columns, search_filter=region, storage_options=_storage(DP2_PATH))
 
 
 def open_gaia(region=None, columns=None):
     """Gaia DR3: position, parallax, G magnitude, colour, and Gaia's own
     variability and quasar-candidate flags."""
-    return lsdb.open_catalog(GAIA_PATH, columns=list(columns or GAIA_COLUMNS), search_filter=region)
+    return lsdb.open_catalog(GAIA_PATH, columns=list(columns or GAIA_COLUMNS), search_filter=region,
+                             storage_options=_storage(GAIA_PATH))
 
 
 def open_euclid(region=None, survey="deep", columns=None):
     """Euclid DR1 objects: the ``wide`` survey, or the ``deep`` fields (our field is one of them).
     Infrared fluxes in the Y and H bands and how concentrated the light is."""
     return lsdb.open_catalog(EUCLID_PATH.format(survey=survey), columns=list(columns or EUCLID_COLUMNS),
-                             search_filter=region)
+                             search_filter=region, storage_options=_storage(EUCLID_PATH))
 
 
 def match(left, right, radius_arcsec=MATCH_RADIUS_ARCSEC, neighbors=1):
@@ -150,7 +177,7 @@ def match(left, right, radius_arcsec=MATCH_RADIUS_ARCSEC, neighbors=1):
 def open_ztf(region=None):
     """ZTF DR24 lightcurves (g, r, i from Palomar, from 2018), read from IRSA's S3 bucket."""
     return lsdb.open_catalog(ZTF_PATH, columns=["objectid", "filterid", "objra", "objdec", "lightcurve"],
-                             search_filter=region, storage_options=ZTF_STORAGE)
+                             search_filter=region, storage_options=_storage(ZTF_PATH))
 
 
 def positions(sources):
@@ -400,7 +427,7 @@ def plot_field(cone, catalogs, width_deg=9.0, density=None, density_label="where
     Only the filled files are read. ``catalogs`` maps a name to the whole catalog. ``density`` (from
     ``sky_density``) shades the area where a catalog really has objects: a file covers its whole tile,
     the data need not."""
-    from matplotlib.patches import Circle, Patch, Polygon
+    from matplotlib.patches import Patch, Polygon
 
     wide = lsdb.ConeSearch(cone.ra, cone.dec, width_deg * 3600)
     styles = {0: dict(edge="tab:blue", fill="tab:blue", lw=1.2, alpha=0.30),
@@ -424,9 +451,6 @@ def plot_field(cone, catalogs, width_deg=9.0, density=None, density_label="where
                                  ls=style.get("ls", "-")))
         ax.plot([], [], color=style["edge"], lw=style["lw"], ls=style.get("ls", "-"), label=f"{name} files: {len(used)} of {total:,} read")
     scale = np.cos(np.radians(cone.dec))
-    ax.add_patch(Circle((cone.ra, cone.dec), cone.radius_arcsec / 3600, fill=False, edgecolor="red", lw=3,
-                        transform=ax.transData))
-    ax.plot([], [], color="red", lw=3, label=f"the field: {cone.radius_arcsec / 3600:.1f}$^\\circ$ cone")
     half = width_deg / 2
     ax.set_xlim(cone.ra + half / scale, cone.ra - half / scale)
     ax.set_ylim(cone.dec - half, cone.dec + half)
@@ -598,7 +622,7 @@ class _TileMap:
         display(Image(data=buf.getvalue()))
 
 
-HEADLINE = "Rubin + lightcurves, matched to Gaia and Euclid, selected and cleaned: one Rubin file at a time"
+HEADLINE = "Rubin + lightcurves, matched to Gaia and Euclid, lightcurves cleaned: one Rubin file at a time"
 
 
 def watch(catalog, client, cone=None, what="AGN candidates and stars", refresh_s=1.0, others=None, headline=HEADLINE,
@@ -680,19 +704,22 @@ def _log_ticks(ax, x=True, y=True):
 
 def plot_structure_function(panels, title=None):
     """One panel per band (``panels``: band -> {label: structure-function table}). Both axes show log10 values.
-    The structure function SF is in magnitudes: the square root of the mean squared difference. AGN curves
-    are red and star curves grey. The dashed line is a damped random walk plus a constant floor (noise that
-    the errors do not account for), fitted to the AGN curve."""
+    The structure function SF is in magnitudes: the square root of the mean squared difference. The colour
+    follows the label: stars grey, AGN red, and AGN in rest-frame time (label contains "rest-frame") purple.
+    The dashed line is a damped random walk plus a constant floor (noise that the errors do not account for),
+    fitted to the last AGN curve of the panel."""
     from scipy.optimize import curve_fit
 
     fig, axes = plt.subplots(1, len(panels), figsize=(6.5 * len(panels), 7), squeeze=False, sharey=True)
     for ax, (band, curves) in zip(axes[0], panels.items()):
+        last_agn = [label for label in curves if "AGN" in label][-1:]
         for label, sf in curves.items():
             agn = "AGN" in label
+            color = "darkviolet" if "rest-frame" in label else "crimson" if agn else "0.4"
             sf = sf[sf.sf_mag > 0]
             ax.errorbar(np.log10(sf.lag_days), np.log10(sf.sf_mag), yerr=sf.err / sf.sf_mag / np.log(10), fmt="o-", ms=8,
-                        lw=2.5, capsize=4, color="crimson" if agn else "0.4", label=label)
-            if agn and len(sf) > 3:
+                        lw=2.5, capsize=4, color=color, label=label)
+            if [label] == last_agn and len(sf) > 3:
                 start = [100.0, float(sf.sf_mag.max()), float(sf.sf_mag.min())]
                 try:
                     best, _ = curve_fit(drw_sf, sf.lag_days, sf.sf_mag, p0=start, sigma=sf.err.clip(lower=0.002),
@@ -714,179 +741,24 @@ def plot_structure_function(panels, title=None):
     return fig
 
 
-def sf2_at(fits, band, days=SF_AT_DAYS):
-    """Squared structure function [mag^2] that a damped-random-walk fit implies in ``band`` at a time difference
-    of ``days``: SF^2 = 2 sigma^2 (1 - exp(-days / tau)). ``fits`` is one row of numbers or a table of them.
-    Timescale and amplitude are poorly known one by one; this combination is what the data constrain."""
-    return 2.0 * fits[f"sigma_{band}"] ** 2 * (1.0 - np.exp(-days / fits["tau_days"]))
-
-
-def fit_carma(ep, star, bands=SF_BANDS, n_start=2000, seed=0):
-    """Fit a damped random walk, the CARMA(1,0) process, to all bands of one lightcurve with EzTaoX.
-
-    The process has a timescale ``tau_days`` and, in each band, a long-term standard deviation ``sigma_<band>``.
-    Each band also gets a mean and an extra noise term ``jitter_<band>``, added to the reported errors, which
-    are too small for bright sources. The fit starts from the best of ``n_start`` random guesses.
-    ``tau_factor`` is the one-sigma uncertainty of the timescale as a multiplicative factor, from the
-    curvature of the likelihood at the best fit. Returns the numbers and the fitted model."""
-    import jax
-
-    jax.config.update("jax_enable_x64", True)
-    import jax.numpy as jnp
-    import numpyro
-    import numpyro.distributions as dist
-    from eztaox.fitter import random_search
-    from eztaox.kernels import quasisep
-    from eztaox.models import MultiVarModel
-    from jax.flatten_util import ravel_pytree
-
-    lc = ep[(ep.star == star) & ep.band.isin(bands)]
-    used = [b for b in bands if (lc.band == b).sum() >= 5]
-    lc = lc[lc.band.isin(used)]
-    t0 = float(lc.mjd.min())
-    medians = lc.groupby("band").mag.median()
-    y = (lc.mag - lc.band.map(medians)).to_numpy()
-    index = lc.band.map({b: i for i, b in enumerate(used)}).to_numpy()
-    model = MultiVarModel((lc.mjd.to_numpy() - t0, index), y, lc.mag_err.to_numpy(),
-                          quasisep.Exp(scale=100.0, sigma=0.1), len(used), zero_mean=False, has_jitter=True)
-
-    def guess():
-        tau = numpyro.sample("tau", dist.Uniform(jnp.log(1.0), jnp.log(1000.0)))
-        sigma = numpyro.sample("sigma", dist.Uniform(jnp.log(0.005), jnp.log(0.5)))
-        return {"log_kernel_param": jnp.stack([tau, sigma]),
-                "log_amp_scale": numpyro.sample("amp", dist.Uniform(-0.5, 0.5).expand([len(used) - 1])),
-                "mean": numpyro.sample("mean", dist.Uniform(-0.05, 0.05).expand([len(used)])),
-                "log_jitter": numpyro.sample("jitter", dist.Uniform(jnp.log(0.002), jnp.log(0.1)).expand([len(used)]))}
-
-    best, _ = random_search(model, guess, jax.random.PRNGKey(seed), n_start, 5, n_opt_step=500)
-    flat, unravel = ravel_pytree(best)
-    hessian = np.asarray(jax.hessian(lambda f: -model.log_prob(unravel(f)))(flat))
-    start = sum(int(np.size(v)) for k, v in best.items() if k < "log_kernel_param")  # ravel_pytree sorts keys
-    try:
-        tau_factor = float(np.exp(np.sqrt(np.diag(np.linalg.inv(hessian)))[start]))
-    except np.linalg.LinAlgError:
-        tau_factor = np.nan
-    log_tau, log_sigma = np.asarray(best["log_kernel_param"])
-    sigmas = np.exp(log_sigma) * np.r_[1.0, np.exp(np.asarray(best["log_amp_scale"]))]
-    numbers = {"star": star, "epochs": len(lc), "tau_days": float(np.exp(log_tau)), "tau_factor": tau_factor}
-    numbers.update({f"sigma_{b}": float(s) for b, s in zip(used, sigmas)})
-    numbers.update({f"jitter_{b}": float(j) for b, j in zip(used, np.exp(np.asarray(best["log_jitter"])))})
-    return numbers, {"model": model, "params": best, "bands": used, "t0": t0, "lc": lc, "medians": medians}
-
-
-def plot_carma(fits, sources, ncols=3):
-    """One panel per fit of ``fit_carma`` (a list of its return values): the lightcurve, relative to each
-    band's median, and the fitted process in each band with its one-sigma range."""
-    import jax.numpy as jnp
-
-    nrows = int(np.ceil(len(fits) / ncols))
-    fig, axes = plt.subplots(nrows, ncols, figsize=(7.5 * ncols, 4.8 * nrows), squeeze=False)
-    for ax, (numbers, fit) in zip(axes.ravel(), fits):
-        lc = fit["lc"]
-        grid = np.linspace(0, float(lc.mjd.max() - fit["t0"]), 300)
-        for i, band in enumerate(fit["bands"]):
-            m = (lc.band == band).to_numpy()
-            color = {**BAND_COLORS, **ZTF_COLORS}[band]
-            ax.errorbar(lc.mjd[m] - 60000, lc.mag[m] - fit["medians"][band], yerr=lc.mag_err[m], fmt="o", ms=4, lw=0.8, capsize=2,
-                        color=color, label=band)
-            mean, sd = fit["model"].pred(fit["params"], (jnp.asarray(grid), jnp.full(len(grid), i, dtype=int)))
-            mean, sd = np.asarray(mean), np.asarray(sd)
-            ax.plot(grid + fit["t0"] - 60000, mean, color=color, lw=1.5)
-            ax.fill_between(grid + fit["t0"] - 60000, mean - sd, mean + sd, color=color, alpha=0.15)
-        ax.invert_yaxis()
-        ax.set_xlabel("MJD $-$ 60000")
-        ax.set_ylabel("mag $-$ band median")
-        first = fit["bands"][0]
-        ax.set_title(f"G = {sources.gaia_G[numbers['star']]:.1f}   timescale {numbers['tau_days']:.0f} d   "
-                     f"SF$^2$({SF_AT_DAYS:.0f} d, {first}) = {sf2_at(numbers, first):.4f} mag$^2$", fontsize=15)
-    axes[0][0].legend(ncol=4, frameon=True, framealpha=0.95, edgecolor="0.3", fontsize=11)
-    for ax in axes.ravel()[len(fits):]:
-        ax.axis("off")
-    fig.tight_layout()
-    return fig
-
-
-def _fit_numbers(lc, star, bands):
-    import jax
-
-    numbers = fit_carma(lc.assign(star=star), star, bands=bands)[0]
-    jax.clear_caches()  # every lightcurve has its own length and is compiled anew; do not let those pile up
-    return numbers
-
-
-def fit_many(ep, stars, client, bands=SF_BANDS):
-    """``fit_carma`` for many sources, spread over the Dask workers. ``ep`` can be the Rubin or the ZTF epoch
-    table. Returns one row of numbers per source."""
-    use = ep[ep.star.isin(stars) & ep.band.isin(bands)][["star", "band", "mjd", "mag", "mag_err"]]
-    pieces = [(g.drop(columns="star"), star) for star, g in use.groupby("star")]
-    futures = client.map(_fit_numbers, [p[0] for p in pieces], [p[1] for p in pieces], bands=tuple(bands), pure=False)
-    return pd.DataFrame(client.gather(futures)).set_index("star")
-
-
-def plot_rubin_ztf(rubin_fits, ztf_fits, band="r"):
-    """Damped-random-walk fits of the same sources from Rubin (6 months, precise) and from ZTF (6 years, noisy),
-    both fitted to the g and r bands only: timescale against timescale, and the implied SF^2 at ``SF_AT_DAYS``
-    in ``band`` against the same. Axes show log10 values. On the dashed line the two surveys agree."""
-    both = rubin_fits.join(ztf_fits, lsuffix="_rubin", rsuffix="_ztf", how="inner")
-    rubin_sf2 = 2 * both[f"sigma_{band}"] ** 2 * (1 - np.exp(-SF_AT_DAYS / both.tau_days_rubin))
-    ztf_sf2 = 2 * both[f"sigma_ZTF {band}"] ** 2 * (1 - np.exp(-SF_AT_DAYS / both.tau_days_ztf))
-    fig, axes = plt.subplots(1, 2, figsize=(17, 7.5))
-    pairs = [(both.tau_days_rubin, both.tau_days_ztf, "timescale [days]", (-0.5, 3.5)),
-             (rubin_sf2, ztf_sf2, f"SF$^2$ at {SF_AT_DAYS:.0f} days in {band} [mag$^2$]", (-5, 0))]
-    for ax, (x, y, what, limits) in zip(axes, pairs):
-        ax.scatter(np.log10(x).clip(*limits), np.log10(y).clip(*limits), s=90, color="crimson", edgecolor="k")
-        ax.plot(limits, limits, color="k", ls="--", lw=2)
-        ax.set_xlim(*limits)
-        ax.set_ylim(*limits)
-        _log_ticks(ax, y=False)
-        ax.yaxis.set_major_locator(ax.xaxis.get_major_locator())
-        ax.set_xlabel(f"Rubin: log$_{{10}}$ {what}")
-        ax.set_ylabel(f"ZTF: log$_{{10}}$ {what}")
-    axes[0].axvspan(np.log10(178), 3.5, color="0.92", zorder=0)
-    axes[0].text(0.97, 0.04, "grey: longer than the Rubin data", transform=axes[0].transAxes, ha="right", fontsize=13)
-    fig.suptitle(f"{len(both)} AGN candidates fitted separately in Rubin (g, r) and in ZTF (g, r)", fontsize=19)
-    fig.tight_layout()
-    return fig
-
-
-def plot_band_sf(carma, measured=None, bands=SF_BANDS, group="AGN", frame="", longest_days=200.0, at_days=SF_AT_DAYS):
-    """Structure functions implied by the damped-random-walk fits of many sources (``carma``: the table of
-    ``fit_many``), one colour per band: SF = sqrt(2) sigma sqrt(1 - exp(-dt / tau)). Each source has one
-    timescale, shared by its bands, and one amplitude per band. The thick line is the median over the sources of
-    the full fitted model, random walk plus the fitted extra noise (2 jitter^2), which is what the measured points
-    contain; the shaded band is the middle half. The thin dashed line is the random-walk part alone. ``measured`` (band -> {label: table}) adds the measured structure function
-    of the group whose label contains ``group`` as points. Both axes show log10 values."""
-    grid = np.geomspace(0.5, 1000, 200)
-    fig, ax = plt.subplots(figsize=(11, 8))
-    for band in bands:
-        fits = carma[carma[f"sigma_{band}"].notna()]
-        walk = np.array([drw_sf(grid, tau, np.sqrt(2) * sigma) for tau, sigma in zip(fits.tau_days, fits[f"sigma_{band}"])])
-        # The fit also has an extra noise term per band (jitter). The measured points had only the reported
-        # errors removed, so they still contain it: two epochs differ by 2 jitter^2 on top of the random walk.
-        curves = np.sqrt(walk ** 2 + 2.0 * fits[f"jitter_{band}"].to_numpy()[:, None] ** 2)
-        low, mid, high = np.log10(np.percentile(curves, [25, 50, 75], axis=0))
-        color = BAND_COLORS[band]
-        ax.fill_between(np.log10(grid), low, high, color=color, alpha=0.12)
-        ax.plot(np.log10(grid), mid, color=color, lw=3.5, label=f"{band}: fitted model, median of {len(fits):,} sources")
-        ax.plot(np.log10(grid), np.log10(np.median(walk, axis=0)), color=color, lw=1.5, ls="--")
-        if measured is not None:
-            sf = next(table for label, table in measured[band].items() if group in label)
+def plot_survey_sf(surveys, title=None, frame=""):
+    """Structure functions of several surveys in one panel (``surveys``: survey name -> {band: structure-function
+    table}). The colour is the band; the first survey has filled circles and solid lines, the second open
+    squares and dashed lines. Both axes show log10 values."""
+    styles = [dict(fmt="o-", mec="w"), dict(fmt="s--", mfc="w", mew=2)]
+    fig, ax = plt.subplots(figsize=(12, 8))
+    for style, (survey, curves) in zip(styles, surveys.items()):
+        for band, sf in curves.items():
             sf = sf[sf.sf_mag > 0]
-            ax.errorbar(np.log10(sf.lag_days), np.log10(sf.sf_mag), yerr=sf.err / sf.sf_mag / np.log(10), fmt="o", ms=9,
-                        color=color, mec="w", capsize=4)
-    if measured is not None:
-        ax.plot([], [], "o", ms=9, color="0.5", mec="w", label="measured structure function")
-    ax.plot([], [], color="0.5", lw=1.5, ls="--", label="dashed: the AGN variability in the fit,\nwithout the fitted extra noise")
-    ax.fill_between([], [], [], color="0.5", alpha=0.25, label="shaded: middle half of the sources")
-    ax.axvline(np.log10(at_days), color="0.4", ls=":", lw=2)
-    ax.axvspan(np.log10(longest_days), 3, color="0.92", zorder=0)
-    ax.text(0.98, 0.03, "grey: longer than the data", transform=ax.transAxes, ha="right", fontsize=13)
-    ax.set_xlim(-0.4, 3)
-    ax.set_ylim(-2.3, -0.3)
+            ax.errorbar(np.log10(sf.lag_days), np.log10(sf.sf_mag), yerr=sf.err / sf.sf_mag / np.log(10), ms=9, lw=2.5,
+                        capsize=4, color=BAND_COLORS[band.split()[-1]], label=f"{survey}: {band.split()[-1]} band", **style)
     _log_ticks(ax)
     ax.set_xlabel(f"log$_{{10}}$ {frame}time between two epochs [days]")
     ax.set_ylabel("log$_{10}$ structure function SF [mag]")
     ax.legend(loc="upper left", frameon=True, framealpha=0.95, edgecolor="0.3")
+    if title:
+        ax.set_title(title)
+    fig.tight_layout()
     return fig
 
 
@@ -894,26 +766,28 @@ def plot_band_sf(carma, measured=None, bands=SF_BANDS, group="AGN", frame="", lo
 # The same analysis inside LSDB: per-partition functions that run on the workers
 # ---------------------------------------------------------------------------------------------------------
 # The cuts, as text that LSDB's ``query`` understands.
-AGN_CUT = "no_parallax and no_motion and not euclid_extended and ir_excess > 0.2"
+# The AGN selection, one cut per survey. Each entry: what the cut is, and the cut as text for ``query``.
+AGN_STEPS = [("Gaia: no parallax and no proper motion", "no_parallax and no_motion"),
+             ("Euclid: a point source", "not euclid_extended"),
+             ("Rubin and Euclid: near-infrared excess over stars", "ir_excess > 0.2")]
+AGN_CUT = " and ".join(cut for _, cut in AGN_STEPS)
 STAR_CUT = "moves and on_star_sequence and not euclid_extended and not gaia_quasar"
 # Objects per file of the catalog we write.
 SAMPLE_PARTITION_ROWS = 300
 FEATURES = ["objectId", "ra", "dec", "gaia_G", "parallax_snr", "no_parallax", "motion_snr", "no_motion", "moves",
-            "gaia_quasar", "rubin_g_r", "euclid_Y_H", "euclid_compactness", "euclid_extended", "ir_excess",
-            "on_star_sequence"]
+            "gaia_quasar", "rubin_g_r", "euclid_Y_H", "euclid_compactness", "euclid_extended"]
+# The columns of the matched catalog that the selection reads: everything except the lightcurves.
+SELECTION_COLUMNS = FEATURES + ["rubin_epochs"]
 
 
-def features(df, sequence=None, parallax_snr_max=PARALLAX_SNR_MAX, motion_snr_max=MOTION_SNR_MAX,
-             motion_snr_min=STAR_MOTION_SNR_MIN, extended_min=EXTENDED_MIN, bright_g=EUCLID_BRIGHT_G,
-             on_sequence_mag=ON_SEQUENCE_MAG):
+def features(df, parallax_snr_max=PARALLAX_SNR_MAX, motion_snr_max=MOTION_SNR_MAX,
+             motion_snr_min=STAR_MOTION_SNR_MIN, extended_min=EXTENDED_MIN, bright_g=EUCLID_BRIGHT_G):
     """Runs on one partition of the three-way match: adds the quantities the selection uses.
 
     Gaia: G magnitude, parallax and proper motion divided by their errors; ``no_parallax`` and ``no_motion``
     mark values below ``parallax_snr_max`` and ``motion_snr_max``, ``moves`` marks either above ``motion_snr_min``.
     Rubin: g - r. Euclid: Y - H (empty for sources brighter than ``bright_g``, which saturate) and
-    ``euclid_extended`` for sources whose light is spread out (``mumax_minus_mag`` above ``extended_min``).
-    ``ir_excess`` is Y - H minus that of stars with the same g - r, given the star ``sequence``;
-    ``on_star_sequence`` marks sources within ``on_sequence_mag`` of it."""
+    ``euclid_extended`` for sources whose light is spread out (``mumax_minus_mag`` above ``extended_min``)."""
     out = df.copy()
     snr = df.parallax_over_error.astype(float)
     motion = np.hypot(df.pmra.astype(float) / df.pmra_error.astype(float), df.pmdec.astype(float) / df.pmdec_error.astype(float))
@@ -933,33 +807,56 @@ def features(df, sequence=None, parallax_snr_max=PARALLAX_SNR_MAX, motion_snr_ma
     out["euclid_Y_H"] = y_h.where(gaia_g > bright_g)
     out["euclid_compactness"] = compact
     out["euclid_extended"] = (compact > extended_min).fillna(False).astype(bool)
-    if sequence is None:
-        out["ir_excess"] = np.nan
-    else:
-        out["ir_excess"] = out.euclid_Y_H - np.interp(out.rubin_g_r.to_numpy(dtype=float), sequence[0], sequence[1])
+    return out
+
+
+def infrared_excess(df, sequence, on_sequence_mag=ON_SEQUENCE_MAG):
+    """Runs on a table or on one partition: adds ``ir_excess``, the Euclid Y - H of each source minus that of
+    stars with the same Rubin g - r (the star ``sequence`` from ``star_sequence``), and ``on_star_sequence``
+    for sources within ``on_sequence_mag`` of the sequence."""
+    out = df.copy()
+    out["ir_excess"] = (df.euclid_Y_H.to_numpy(dtype=float)
+                        - np.interp(df.rubin_g_r.to_numpy(dtype=float), sequence[0], sequence[1]))
     out["on_star_sequence"] = (out.ir_excess.abs() < on_sequence_mag).fillna(False).astype(bool)
     return out
 
 
-def clean_lightcurves(df, min_epochs=MIN_EPOCHS):
+def label(df):
+    """Runs on one partition of selected objects: adds ``kind``, ``AGN`` for objects that pass ``AGN_CUT`` and
+    ``star`` for the others."""
+    out = df.copy()
+    columns = [c for c in df.columns if c != "lightcurve"]
+    out["kind"] = np.where(pd.DataFrame(df[columns]).eval(AGN_CUT).to_numpy(), "AGN", "star") if len(df) else ""
+    return out
+
+
+def selection_steps(sources, steps=AGN_STEPS):
+    """Print how many ``sources`` remain after each cut of ``steps``, applied one after the other."""
+    left = sources
+    print(f"{'in Rubin, Gaia and Euclid':<52}{len(left):>8,}")
+    for what, cut in steps:
+        left = left.query(cut)
+        print(f"{what:<52}{len(left):>8,}   {cut}")
+    return left
+
+
+def clean_lightcurves(df):
     """Runs on one partition: replaces the raw Rubin forced photometry of each object by its clean lightcurve
-    (nested column ``lightcurve``: band, mjd, mag, mag_err; see ``epochs``), labels each object ``AGN`` or
-    ``star`` and keeps the objects with at least ``min_epochs`` clean epochs."""
+    (nested column ``lightcurve``: band, mjd, mag, mag_err; see ``epochs``) and adds ``rubin_epochs``, the
+    number of clean epochs. Every object is kept."""
     import nested_pandas as npd
 
     index_name = df.index.name or "_healpix_29"
     base = pd.DataFrame(df[FEATURES]).reset_index()
-    base["kind"] = np.where(pd.DataFrame(df[FEATURES]).eval(AGN_CUT).to_numpy(), "AGN", "star") if len(df) else ""
     if len(df):
         ep = epochs(df)
     else:
         ep = pd.DataFrame({"star": np.array([], dtype=int), "band": np.array([], dtype=str), "mjd": np.array([], dtype=float),
                            "mag": np.array([], dtype=float), "mag_err": np.array([], dtype=float)})
     base["rubin_epochs"] = ep.groupby("star").size().reindex(base.index, fill_value=0).to_numpy().astype("int64")
-    keep = base.rubin_epochs >= min_epochs
-    flat = ep[ep.star.isin(base.index[keep])].set_index("star")[["band", "mjd", "mag", "mag_err"]]
+    flat = ep.set_index("star")[["band", "mjd", "mag", "mag_err"]]
     flat.index.name = None
-    out = npd.NestedFrame(base[keep]).join_nested(flat, "lightcurve")
+    out = npd.NestedFrame(base).join_nested(flat, "lightcurve")
     return out.set_index(index_name)
 
 
@@ -1009,6 +906,22 @@ def pair_sums(df, bands=SF_BANDS, lag_bins=LAG_BINS):
     out = pd.DataFrame(rows, columns=["objectId", "kind", "band", "bin", "pairs", "sum_d2", "sum_noise", "sum_lag"])
     return out.astype({"objectId": "int64", "kind": str, "band": str, "bin": "int64", "pairs": "int64",
                        "sum_d2": float, "sum_noise": float, "sum_lag": float})
+
+
+def nested_lightcurves(ep, kind="AGN", redshift=None):
+    """A long table of epochs (``star``, ``band``, ``mjd``, ``mag``, ``mag_err``) as one row per object with a
+    nested ``lightcurve`` column, the layout ``pair_sums`` and ``rest_frame`` read. Every object gets the same
+    ``kind``. ``redshift`` (a Series indexed by objectId) adds a ``redshift`` column."""
+    import nested_pandas as npd
+
+    ids = np.sort(ep.star.unique())
+    base = pd.DataFrame({"objectId": ids, "kind": kind})
+    if redshift is not None:
+        base["redshift"] = redshift.reindex(ids).to_numpy(dtype=float)
+    base = npd.NestedFrame(base)
+    flat = ep[["band", "mjd", "mag", "mag_err"]].copy()
+    flat.index = np.searchsorted(ids, ep.star.to_numpy())
+    return base.join_nested(flat.sort_index(), "lightcurve")
 
 
 def equal_pairs(sums, points=SF_POINTS, kind="AGN"):
@@ -1074,29 +987,6 @@ def structure_functions_of(sums, labels, remove_noise=False, bands=SF_BANDS, ids
                    for kind, label in labels.items()} for band in bands}
 
 
-def fit_partition(df, bands=SF_BANDS):
-    """Runs on one partition: a damped-random-walk fit (``fit_carma``) for every AGN candidate in it.
-    Returns one row of numbers per object (with its position and redshift, if the partition has a redshift)."""
-    import jax
-
-    table = df.reset_index(drop=True)
-    extra = ["ra", "dec", "redshift"] if "redshift" in table.columns else []
-    rows = []
-    if len(table):
-        flat = table["lightcurve"].nest.to_flat()
-        for row in np.flatnonzero((table.kind == "AGN").to_numpy()):
-            lc = pd.DataFrame({c: flat.loc[[row], c].to_numpy() for c in ("band", "mjd", "mag", "mag_err")})
-            lc["band"] = lc.band.astype(str)
-            lc["star"] = table.objectId[row]
-            numbers = fit_carma(lc, table.objectId[row], bands=bands)[0]
-            jax.clear_caches()
-            rows.append({"objectId": numbers.pop("star"), **numbers, **{c: float(table[c][row]) for c in extra}})
-    columns = ["objectId", "epochs", "tau_days", "tau_factor", *[f"sigma_{b}" for b in bands],
-               *[f"jitter_{b}" for b in bands], *extra]
-    out = pd.DataFrame(rows, columns=columns)
-    return out.astype({"objectId": "int64", "epochs": "int64", **{c: float for c in columns[2:]}})
-
-
 # ---------------------------------------------------------------------------------------------------------
 # Redshifts from Milliquas, and the rest frame
 # ---------------------------------------------------------------------------------------------------------
@@ -1104,10 +994,6 @@ MILLIQUAS_URL = "https://quasars.org/milliquas.fits.zip"
 MILLIQUAS_DIR = os.path.join(RESULTS_DIR, "milliquas")
 # Objects per file of the Milliquas catalog built in memory.
 MILLIQUAS_PARTITION_ROWS = 500
-# In the rest frame the data span about 80 days, so the amplitude is quoted at this time difference [days].
-REST_SF_AT_DAYS = 30.0
-# Central wavelengths of the Rubin bands [nm].
-BAND_NM = {"u": 372.0, "g": 481.0, "r": 622.0, "i": 754.0, "z": 869.0, "y": 971.0}
 MJD_ZERO = 60000.0
 
 
@@ -1163,36 +1049,6 @@ def plot_catalog(catalog, table, cone=None, others=None, title="", tile="file of
                       ncol=2, frameon=True, framealpha=0.95, edgecolor="0.3", fontsize=12)
     picture.ax.set_title(title, pad=12, fontsize=16)
     display(picture.fig)
-
-
-def plot_rest_wavelength(carma, bands=SF_BANDS, days=REST_SF_AT_DAYS, n_bins=7):
-    """Variability against the wavelength at which the light left the source. Each fitted source gives one
-    point per band: the band's wavelength divided by (1 + redshift), and SF^2 at ``days`` rest-frame days
-    implied by its fit. Black: median in bins of wavelength, with the spread of the median. log10 axes."""
-    fig, ax = plt.subplots(figsize=(11, 8))
-    xs, ys = [], []
-    for band in bands:
-        x = np.log10(BAND_NM[band] / (1.0 + carma.redshift))
-        y = np.log10(sf2_at(carma, band, days))
-        ok = np.isfinite(x) & np.isfinite(y)
-        ax.plot(x[ok], y[ok], "o", ms=5, alpha=0.45, color=BAND_COLORS[band], label=f"{band} band")
-        xs.append(x[ok].to_numpy())
-        ys.append(y[ok].to_numpy())
-    x, y = np.concatenate(xs), np.concatenate(ys)
-    edges = np.quantile(x, np.linspace(0, 1, n_bins + 1))
-    which = np.clip(np.digitize(x, edges) - 1, 0, n_bins - 1)
-    mid = [np.median(x[which == k]) for k in range(n_bins)]
-    med = [np.median(y[which == k]) for k in range(n_bins)]
-    err = [1.25 * np.std(y[which == k]) / np.sqrt((which == k).sum()) for k in range(n_bins)]
-    ax.errorbar(mid, med, yerr=err, fmt="s-", color="k", ms=11, lw=3, capsize=5, label="median in bins", zorder=5)
-    slope = np.polyfit(mid, med, 1)[0]
-    ax.set_ylim(np.percentile(y, 1) - 0.2, np.percentile(y, 99) + 0.4)
-    ax.set_xlabel("log$_{10}$ rest-frame wavelength [nm]")
-    ax.set_ylabel(f"log$_{{10}}$ SF$^2$ at {days:.0f} rest-frame days [mag$^2$]")
-    ax.set_title(f"{len(carma):,} AGN with a redshift: slope of the medians {slope:.2f}")
-    ax.grid(alpha=0.3)
-    ax.legend(loc="upper right", frameon=True, framealpha=0.95, edgecolor="0.3")
-    return fig
 
 
 # ---------------------------------------------------------------------------------------------------------

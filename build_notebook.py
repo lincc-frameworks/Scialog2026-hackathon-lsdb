@@ -46,7 +46,8 @@ Where to go from here:
 - **Make your own catalog**: [hats-import](https://hats-import.readthedocs.io) for large files; `lsdb.from_dataframe` for a table in memory (used below).
 - **Lightcurves in a column**: [nested-pandas](https://nested-pandas.readthedocs.io).
 - **Code and questions**: [github.com/astronomy-commons/lsdb](https://github.com/astronomy-commons/lsdb).
-- **Talk to us**: the [#lincc-frameworks-lsdb](https://lsstc.slack.com/archives/C04610PQW9F) channel on the LSST Discovery Alliance Slack.
+- **Talk to us**: the [#lincc-frameworks-lsdb](https://lsstc.slack.com/archives/C04610PQW9F) channel on the LSST Discovery Alliance Slack;
+  all ways to reach the team are on the [contact page](https://docs.lsdb.io/en/latest/contact.html).
 """),
     md("section-hats", """
 ## HATS: the sky cut into files
@@ -66,12 +67,12 @@ import lsdb
 import matplotlib.pyplot as plt
 import pandas as pd
 
-from prep import (AGN_CUT, MILLIQUAS_PARTITION_ROWS, REST_SF_AT_DAYS, STAR_CUT, ZTF_MATCH_RADIUS_ARCSEC, as_catalog, catalog_path, clean_lightcurves, features,
-                  field, fit_carma, fit_many, fit_partition, inside_fraction, keep, kept, lightcurve_table, match,
-                  equal_pairs, milliquas, open_euclid, open_gaia, open_rubin, open_ztf, pair_sums, plot_band_sf, plot_carma,
+from prep import (AGN_CUT, MIN_EPOCHS, MILLIQUAS_PARTITION_ROWS, SELECTION_COLUMNS, STAR_CUT, ZTF_MATCH_RADIUS_ARCSEC, as_catalog, catalog_path, clean_lightcurves, features, infrared_excess, label, selection_steps,
+                  field, inside_fraction, keep, kept, lightcurve_table, match,
+                  equal_pairs, milliquas, open_euclid, open_gaia, open_rubin, open_ztf, pair_sums,
                   plot_catalog, plot_field, plot_how_it_works, rest_frame, structure_function_of,
-                  plot_lightcurves, plot_long_lightcurves, plot_rubin_ztf, plot_selection, plot_structure_function,
-                  plot_tiling, positions, replay, sf2_at, sky_density, star_sequence, structure_functions_of, watch,
+                  plot_lightcurves, plot_long_lightcurves, plot_selection, plot_survey_sf, nested_lightcurves, LAG_BINS_ZTF, plot_structure_function,
+                  plot_tiling, positions, replay, sky_density, star_sequence, structure_functions_of, watch,
                   workers, ztf_epochs)
 
 compute = False  # False: load what was saved ahead of time and replay the recorded runs. True: run everything.
@@ -103,7 +104,7 @@ euclid_area = sky_density(euclid_sky, cone)
 plot_field(cone, {"Rubin DP2": rubin_sky, "Gaia DR3": gaia_sky, "Euclid DR1 deep": euclid_sky},
            density=euclid_area, density_label="where Euclid deep has objects")
 plt.show()
-print(f"{100 * inside_fraction(euclid_area, cone):.1f} per cent of the Euclid deep objects in this picture are inside the red circle.")
+print(f"{100 * inside_fraction(euclid_area, cone):.1f} per cent of the Euclid deep objects in this picture are inside the {cone.radius_arcsec / 3600:.1f} degree cone we search.")
 print("A file covers its whole tile; the data cover only the shaded part.")
 
 rubin = open_rubin(cone)
@@ -126,77 +127,83 @@ for name, part, whole in (("Rubin", rubin, rubin_sky), ("Gaia", gaia, gaia_sky),
   in a nested column of the same file, so the crossmatch brings the photometry along.
 """),
     md("section-match", """
-## Crossmatch all three
+## Crossmatch all three, once
 
-`a.crossmatch(b, radius_arcsec=1)` returns a new lazy catalog; nothing is read until `.compute()`.
+`a.crossmatch(b, radius_arcsec=1)` returns a new lazy catalog; nothing is read until it is computed.
 Chaining two of them matches Rubin to Gaia and the result to Euclid, so every source that comes out is
-in all three catalogs. Printing a lazy catalog (last line of the cell) shows its columns and its number
-of partitions without reading data. Without the lightcurves the result is small and runs live.
-"""),
-    code("crossmatch", "Sources that are in Rubin, Gaia and Euclid", """
-start = time.time()
-three = match(match(rubin, gaia), euclid)
-raw = three.compute()
+in all three catalogs. Two more calls work on each partition (a pandas table) on the workers:
 
-sequence = star_sequence(features(raw))
-sources = features(raw, sequence).set_index("objectId")
-print(f"{len(sources):,} sources are in all three catalogs  ({time.time() - start:.0f} s)")
-three
-""", question="Which sources are in all three catalogs?", qtype="association"),
-    md("section-select", """
-## Selecting AGN candidates
+- `catalog.map_partitions(features)` computes the quantities the selection needs from the three surveys;
+- `catalog.map_partitions(clean_lightcurves)` replaces the raw Rubin photometry by a clean lightcurve,
+  kept in a nested column.
 
-The crossmatch result is a pandas table, so the selection is ordinary pandas. Each survey contributes one
-cut. Gaia: no parallax and no proper motion. Euclid: a point source (peak surface brightness minus total
-magnitude is the same small number for all point sources and larger for galaxies). Rubin and Euclid
-together: brighter in the near-infrared than a star of the same optical colour. The cut is one line of
-text, and the same text is given to LSDB's `query` below.
-"""),
-    code("agn-select", "One cut per survey selects the AGN candidates", """
-print("AGN candidates: ", AGN_CUT)
-print("comparison stars:", STAR_CUT)
-picked = sources.query(AGN_CUT)
-plot_selection(sources, picked.index)
-plt.show()
-print(f"{len(picked):,} of {len(sources):,} sources pass the AGN cut; "
-      f"{picked.gaia_quasar.sum()} of them are in Gaia's own list of quasar candidates.")
-""", question="Can colour, shape and astrometry select AGN, using all three surveys?", qtype="association"),
-    md("section-lsdb", """
-## The same selection inside LSDB, with lightcurves
-
-A table that does not fit in memory should not be computed whole. LSDB gives three tools for working on
-it in place, and this cell chains them:
-
-- `catalog.map_partitions(f)`: run your own function `f` on every partition (a pandas table) on the workers;
-- `catalog.query("...")`: keep rows, with pandas query syntax;
-- `catalog.to_hats(path)`: write the result as a new HATS catalog, which anyone can open and crossmatch.
-
-Here the workers match the three catalogs with the Rubin lightcurves (7 million epochs), compute the
-selection quantities, keep the AGN candidates and comparison stars, and clean their lightcurves, one
-Rubin file at a time. Only the small result comes back. `lsdb.from_dataframe` turns that table into a
-catalog and `to_hats` writes it.
+The result (44 thousand sources with their lightcurves) is written as a new HATS catalog:
+`lsdb.from_dataframe` turns the table into a catalog and `to_hats` writes it. Everything after this cell
+reads that catalog; the three surveys are not opened again.
 
 This takes about four minutes on eight workers, so it was run ahead of time; the map replays the
 recorded run. Set `compute = True` in the first cell to run it again.
 """),
-    code("sample", "Crossmatch, select and clean on the workers; write a new HATS catalog", """
-with_lightcurves = match(match(open_rubin(cone, lightcurves=True), gaia), euclid)
-sample = (with_lightcurves
-          .map_partitions(features, sequence=sequence)
-          .query(f"({AGN_CUT}) or ({STAR_CUT})")
-          .map_partitions(clean_lightcurves))
+    code("crossmatch", "Crossmatch Rubin, Gaia and Euclid with lightcurves; write a new HATS catalog", """
+matched = (match(match(open_rubin(cone, lightcurves=True), gaia), euclid)
+           .map_partitions(features)
+           .map_partitions(clean_lightcurves))
 
-others = {"Gaia DR3 files": gaia, "Euclid DR1 deep files": euclid}
+picture = dict(what="sources in all three catalogs", others={"Gaia DR3 files": gaia, "Euclid DR1 deep files": euclid})
 if compute:
-    table, tiles = watch(sample, client, cone, others=others)
-    as_catalog(table).to_hats(catalog_path(cone), catalog_name="agn_and_stars", overwrite=True)
+    everything, tiles = watch(matched, client, cone, **picture)
+    as_catalog(everything).to_hats(catalog_path(cone, "rubin_gaia_euclid"), catalog_name="rubin_gaia_euclid", overwrite=True)
     keep(cone, "tiles", tiles)
 else:
-    replay(kept(cone, "tiles"), cone, others=others)
+    replay(kept(cone, "tiles"), cone, **picture)
+
+matched = lsdb.open_catalog(catalog_path(cone, "rubin_gaia_euclid"))
+print(f"{len(matched):,} sources are in all three catalogs, in {len(matched.get_healpix_pixels())} files")
+matched
+""", question="Which sources are in all three catalogs?", qtype="association"),
+    md("section-select", """
+## Selecting AGN candidates, one cut at a time
+
+The selection needs no lightcurves, so only the other columns of the new catalog are read (`columns=`),
+which takes about a second. Each survey contributes one cut. Gaia: no parallax and no proper motion.
+Euclid: a point source (peak surface brightness minus total magnitude is the same small number for all
+point sources and larger for galaxies). Rubin and Euclid together: brighter in the near-infrared than a
+star of the same optical colour. The cell prints how many sources remain after each cut.
+"""),
+    code("agn-select", "One cut per survey selects the AGN candidates", """
+start = time.time()
+sources = lsdb.open_catalog(catalog_path(cone, "rubin_gaia_euclid"), columns=SELECTION_COLUMNS).compute()
+sequence = star_sequence(sources)  # the colours of ordinary stars, from sources that Gaia sees move
+sources = infrared_excess(sources, sequence).set_index("objectId")
+print(f"selection columns of {len(sources):,} sources read in {time.time() - start:.1f} s\\n")
+
+picked = selection_steps(sources)
+print(f"\\n{picked.gaia_quasar.sum()} of the {len(picked):,} selected are in Gaia's own list of quasar candidates.")
+plot_selection(sources, picked.index)
+plt.show()
+""", question="Can colour, shape and astrometry select AGN, using all three surveys?", qtype="association"),
+    md("section-lsdb", """
+## The selection as a new catalog
+
+The same cuts, as text, go to `catalog.query(...)`, which keeps rows of a lazy catalog with pandas query
+syntax. Here it keeps the AGN candidates and a set of comparison stars (sources that Gaia sees move and
+that lie on the star sequence), both with at least 50 clean epochs. `to_hats` writes the lazy result
+directly as a second, smaller catalog; this runs live.
+"""),
+    code("sample", "Query the catalog for AGN candidates and comparison stars; write them with to_hats", """
+start = time.time()
+print("AGN candidates: ", AGN_CUT)
+print("comparison stars:", STAR_CUT)
+selected = (matched
+            .map_partitions(infrared_excess, sequence=sequence)
+            .query(f"rubin_epochs >= {MIN_EPOCHS} and (({AGN_CUT}) or ({STAR_CUT}))")
+            .map_partitions(label))
+selected.to_hats(catalog_path(cone), catalog_name="agn_and_stars", overwrite=True)
 
 agn_stars = lsdb.open_catalog(catalog_path(cone))
+print(f"selected and written in {time.time() - start:.0f} s")
 agn_stars
-""", question="Can the selection and the lightcurve cleaning run inside LSDB?"),
+""", question="How do I keep a selection as a catalog of its own?"),
     code("agn-lightcurves", "Lightcurves of AGN candidates (top) and comparison stars (bottom)", """
 table = agn_stars.compute()
 ep = lightcurve_table(table)
@@ -239,9 +246,11 @@ the pattern for any per-object statistic in LSDB: write a function that takes on
 a small table (`pair_sums`), and call `agn_stars.map_partitions(pair_sums).compute()`. The nested
 lightcurve column is unpacked inside the function with nested-pandas.
 
-The notebook then merges the time bins so that every point is built from about the same number of AGN
-pairs, and takes the median over objects in each band. Stars that do not vary give a flat line at the
-noise level; AGN rise with time. The dashed line is a damped random walk (slope 1/2), the usual AGN model.
+For each pair of epochs the noise its two reported errors predict, err1² + err2², is subtracted from the
+squared difference, so the plot shows the variability that the errors do not explain. The notebook then
+merges the time bins so that every point is built from about the same number of AGN pairs, and takes the
+median over objects in each band. Stars that do not vary stay near zero; AGN rise with time. The dashed
+line is a damped random walk (slope 1/2), the usual AGN model.
 """),
     code("structure-function", "AGN differ more the longer you wait; stars do not", """
 start = time.time()
@@ -249,51 +258,11 @@ sums = equal_pairs(agn_stars.map_partitions(pair_sums).compute())
 print(f"{int(sums.pairs.sum()):,} pairs of epochs, binned on the workers  ({time.time() - start:.0f} s)")
 
 labels = {"AGN": f"AGN candidates ({len(agn):,})", "star": f"stars ({len(calm):,})"}
-sf = structure_functions_of(sums, labels)
-plot_structure_function(sf, title="Structure function as measured")
+sf = structure_functions_of(sums, labels, remove_noise=True)
+plot_structure_function(sf, title="Structure function with the measurement noise removed")
 plt.show()
 sf["r"][labels["AGN"]].round(3)
 """, question="How does the variability of AGN differ from that of stars?", qtype="association"),
-    md("section-noise", """
-### Removing the measurement noise
-
-For each pair of epochs the noise its two reported errors predict, err1² + err2², is subtracted from the
-squared difference. `pair_sums` already returned both sums, so no data is read again.
-"""),
-    code("structure-function-noise", "The structure function with the measurement noise removed", """
-sf_clean = structure_functions_of(sums, labels, remove_noise=True)
-plot_structure_function(sf_clean, title="Structure function with the measurement noise removed")
-plt.show()
-
-print("Stars, median over the time bins [mag]. Zero means the reported errors explain the scatter.")
-pd.DataFrame({band: {"as measured": sf[band][labels["star"]].sf_mag.median(),
-                     "noise removed": sf_clean[band][labels["star"]].sf_mag.median()} for band in sf}).round(3)
-""", question="What is left when the measurement noise is removed?", qtype="association"),
-    md("section-carma", """
-## A model fit for single lightcurves
-
-Any Python code can run on the rows of a catalog. Here EzTaoX (JAX) fits a damped random walk to the
-g, r, i and z lightcurves of one source at once: one timescale, one amplitude per band and an extra noise
-term per band. The six examples are fitted in the notebook; the next sections give the same function to
-LSDB. With six months of data the timescale and amplitude are poorly known one by one, so we quote
-their combination, the squared structure function the fit implies at a given time difference.
-"""),
-    code("carma", "Damped-random-walk fits to AGN candidates with the most data", """
-per_band = ztf.groupby(["star", "band"]).size().unstack(fill_value=0).reindex(agn.index, fill_value=0)
-in_ztf = per_band.index[(per_band["ZTF g"] >= 8) & (per_band["ZTF r"] >= 8)]
-top = agn.loc[in_ztf].rubin_epochs.sort_values(ascending=False).index[:100]
-print(f"{len(in_ztf)} AGN candidates are well observed by ZTF.")
-
-start = time.time()
-fits = [fit_carma(ep, star) for star in top[:6]]
-print(f"{len(fits)} fits in {time.time() - start:.0f} s")
-plot_carma(fits, table)
-plt.show()
-examples = pd.DataFrame([f[0] for f in fits]).set_index("star")
-for band in "griz":
-    examples[f"SF2(100 d) {band}"] = sf2_at(examples, band)
-examples[["epochs", "tau_days", "tau_factor"] + [f"SF2(100 d) {band}" for band in "griz"]].round(4)
-""", question="What are the CARMA parameters of single AGN?", qtype="descriptive"),
     md("section-redshift", """
 ## A catalog that is not in HATS: `lsdb.from_dataframe`
 
@@ -336,68 +305,41 @@ The structure function is then computed with the same `pair_sums` as before.
 rest = agn_z.map_partitions(rest_frame)
 sums_rest = equal_pairs(rest.map_partitions(pair_sums).compute())
 
-with_z = f"AGN with a redshift ({len(known):,}), rest-frame time"
-sf_rest = {band: {with_z: structure_function_of(sums_rest, "AGN", band, remove_noise=True),
-                  "the same, observed time": structure_function_of(sums, "AGN", band, remove_noise=True, ids=known.objectId)}
+observed, with_z = f"AGN with a redshift ({len(known):,}), observed time", "the same AGN, rest-frame time"
+sf_rest = {band: {labels["star"]: sf[band][labels["star"]],
+                  observed: structure_function_of(sums, "AGN", band, remove_noise=True, ids=known.objectId),
+                  with_z: structure_function_of(sums_rest, "AGN", band, remove_noise=True)}
            for band in "griz"}
 plot_structure_function(sf_rest, title="Structure function, noise removed: observed time and rest-frame time")
 plt.show()
 sf_rest["r"][with_z].round(3)
 """, question="How does the structure function change in the rest frame?", qtype="association"),
-    md("section-bands", """
-### Watching `map_partitions` fill a catalog
-
-The fit for every AGN with a redshift is `rest.map_partitions(fit_partition)`: the function runs on each
-partition, on the rest-frame lightcurves, and returns one row of numbers per object. The map shows the
-work as it happens: a tile turns green when its task is back, and each fitted AGN appears as a point
-coloured by its redshift. To follow the tasks yourself, as `watch` in `prep.py` does, use
-`catalog.to_delayed()` (one Dask task per partition) and `as_completed`. This was run ahead of time on
-30 workers; the map replays the recorded run.
-
-Each fit implies a structure function in each band; bluer bands lie higher.
-"""),
-    code("carma-bands", "AGN with a redshift fitted in the rest frame: bluer bands vary more", """
-all_fits = rest.map_partitions(fit_partition)
-picture = dict(what="fits", headline="map_partitions(fit_partition): a rest-frame fit for every AGN with a redshift",
-               tile="catalog file", done="fitted", value_label="redshift")
-if compute:
-    client = workers(30, memory="4GB")
-    carma, fit_tiles = watch(all_fits, client, cone, points=("ra", "dec", "redshift"), **picture)
-    keep(cone, "carma_rest", carma)
-    keep(cone, "fit_tiles_rest", fit_tiles)
-else:
-    replay(kept(cone, "fit_tiles_rest"), cone, **picture)
-carma = kept(cone, "carma_rest").set_index("objectId")
-
-plot_band_sf(carma, sf_rest, frame="rest-frame ", longest_days=178 / (1 + carma.redshift.median()),
-             at_days=REST_SF_AT_DAYS)
-plt.show()
-print(f"{len(carma):,} fits.  Median SF^2 at {REST_SF_AT_DAYS:.0f} rest-frame days implied by the fits [mag^2]:  "
-      + ",  ".join(f"{b} {sf2_at(carma, b, REST_SF_AT_DAYS).median():.4f}" for b in "griz"))
-print(f"Median fitted rest-frame timescale (one per source, shared by g, r, i, z): {carma.tau_days.median():.0f} days "
-      f"(middle half {carma.tau_days.quantile(0.25):.0f} to {carma.tau_days.quantile(0.75):.0f})")
-""", question="Do AGN vary more at bluer rest-frame wavelengths?", qtype="association"),
     md("section-rubin-ztf", """
-### Rubin against ZTF
+### The same AGN in two surveys
 
-ZTF saw the same sources for six years, with fewer and noisier epochs. The same model is fitted to the
-ZTF lightcurves alone, for the 100 AGN candidates with the most Rubin epochs among those well observed
-by ZTF. ZTF has g and r, so for this comparison the Rubin lightcurves are fitted again with g and r only:
-both timescales then come from the same two bands. These sources are near ZTF's detection limit, with
-errors of 0.1 to 0.2 mag per epoch.
+ZTF saw the same sources for seven years in g and r, with noisier epochs (errors of 0.1 to 0.2 mag;
+these sources are near its detection limit). The ZTF lightcurves came from the crossmatch above. For the
+AGN with a redshift that ZTF observed well, the same two functions are applied to them: `rest_frame`
+moves the times to the rest frame and `pair_sums` gives the structure function, with the noise of the
+reported errors removed in the same way. In both surveys the structure function rises with the time
+between epochs, and g lies above r. ZTF reaches rest-frame time differences of years. Its values rest on
+the reported ZTF errors being right, since the noise removed is larger than what remains.
 """),
-    code("carma-ztf", "The same model fitted to ZTF alone and to Rubin alone, g and r bands", """
-if compute:
-    keep(cone, "carma_rubin_gr", fit_many(ep, top, client, bands=("g", "r")))
-    keep(cone, "carma_ztf", fit_many(ztf, top, client, bands=("ZTF g", "ZTF r")))
-carma_gr, carma_ztf = kept(cone, "carma_rubin_gr"), kept(cone, "carma_ztf")
+    code("sf-two-surveys", "The rest-frame structure function of the same AGN from Rubin and from ZTF", """
+start = time.time()
+z = known.set_index("objectId").redshift
+per_band = ztf.groupby(["star", "band"]).size().unstack(fill_value=0)
+in_ztf = per_band.index[(per_band["ZTF g"] >= 8) & (per_band["ZTF r"] >= 8)]  # at least 8 ZTF epochs in g and in r
+both = z.index[z.index.isin(in_ztf)]  # AGN with a redshift that ZTF observed well
+ztf_rest = rest_frame(nested_lightcurves(ztf[ztf.star.isin(both)], redshift=z))
+sums_ztf = equal_pairs(pair_sums(ztf_rest, bands=("ZTF g", "ZTF r"), lag_bins=LAG_BINS_ZTF), points=8)
+print(f"{int(sums_ztf.pairs.sum()):,} pairs of ZTF epochs of {len(both)} AGN with a redshift  ({time.time() - start:.0f} s)")
 
-plot_rubin_ztf(carma_gr, carma_ztf)
+two = {"Rubin, six months": {b: structure_function_of(sums_rest, "AGN", b, remove_noise=True, ids=both) for b in ("g", "r")},
+       "ZTF, seven years": {b: structure_function_of(sums_ztf, "AGN", b, remove_noise=True) for b in ("ZTF g", "ZTF r")}}
+plot_survey_sf(two, frame="rest-frame ", title=f"The same {len(both)} AGN with a redshift in two surveys, noise removed")
 plt.show()
-ztf_r = carma_ztf.rename(columns={"sigma_ZTF r": "sigma_r"})
-print(f"Median timescale: Rubin {carma_gr.tau_days.median():.0f} d, ZTF {carma_ztf.tau_days.median():.0f} d.")
-print(f"Median SF^2 at 100 days in r: Rubin {sf2_at(carma_gr, 'r').median():.4f}, ZTF {sf2_at(ztf_r, 'r').median():.4f} mag^2.")
-""", question="Do Rubin and ZTF give the same variability parameters?", qtype="association"),
+""", question="Do Rubin and ZTF show the same variability for the same AGN?", qtype="association"),
     md("summary", """
 ## What to take away
 
@@ -415,8 +357,8 @@ print(f"Median SF^2 at 100 days in r: Rubin {sf2_at(carma_gr, 'r').median():.4f}
 
 - One cut per survey selects about a thousand AGN candidates without using variability.
 - Their structure function rises with the time between epochs in every band; that of the stars is flat.
-- About 300 have a Milliquas redshift. In rest-frame time, a damped random walk fitted with EzTaoX shows
-  that bluer bands vary more.
+- About 300 have a Milliquas redshift. In rest-frame time their structure function rises with time and is
+  larger in bluer bands, in Rubin and in ZTF lightcurves of the same AGN.
 
 **Try it yourself**
 
